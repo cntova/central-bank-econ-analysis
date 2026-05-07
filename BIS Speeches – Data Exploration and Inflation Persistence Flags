@@ -1,0 +1,265 @@
+---
+title: "BIS Speeches – Data Exploration and Inflation Persistence Flags (Q3)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+dir.create("figures", showWarnings = FALSE)
+dir.create("tables",  showWarnings = FALSE)
+```
+
+# Libraries
+
+```{r libraries}
+library(readr)      # fast CSV reading with type guessing
+library(dplyr)      # data manipulation
+library(lubridate)  # date parsing
+library(stringr)    # text operations and word boundary counts
+library(ggplot2)    # plotting
+```
+
+# Load Data
+
+```{r load_data}
+# Read BIS speech corpus; higher guess_max improves column type detection
+# on large text files.
+speeches <- read_csv("BIS_speeches.csv", guess_max = 100000)
+
+# Retain only the columns needed for this analysis
+speeches <- speeches %>%
+  select(url, title, description, date, text, author)
+```
+
+# Clean
+
+```{r clean}
+speeches <- speeches %>%
+  mutate(
+    date_parsed = lubridate::ymd(date, quiet = TRUE),
+    year        = lubridate::year(date_parsed),
+    author      = stringr::str_squish(as.character(author)),
+    title       = stringr::str_squish(as.character(title)),
+    text        = as.character(text)
+  ) %>%
+  filter(!is.na(date_parsed), !is.na(text)) %>%
+  distinct(url, date_parsed, author, title, .keep_all = TRUE)
+```
+
+# Word Count
+
+```{r word_count}
+# Consistent speech-length metric using linguistic word boundaries
+speeches <- speeches %>%
+  mutate(word_count = str_count(text, boundary("word")))
+```
+
+# Part A: Basic Corpus Statistics
+
+```{r summary_stats}
+total_speeches   <- nrow(speeches)
+time_start       <- min(speeches$date_parsed, na.rm = TRUE)
+time_end         <- max(speeches$date_parsed, na.rm = TRUE)
+unique_speakers  <- n_distinct(speeches$author)
+
+wc                <- speeches$word_count
+word_count_min    <- min(wc,    na.rm = TRUE)
+word_count_max    <- max(wc,    na.rm = TRUE)
+word_count_mean   <- mean(wc,   na.rm = TRUE)
+word_count_median <- median(wc, na.rm = TRUE)
+word_count_sd     <- sd(wc,     na.rm = TRUE)
+
+# Additional feature: flag speeches that mention "inflation"
+speeches <- speeches %>%
+  mutate(mentions_inflation =
+           str_detect(text, regex("\\binflation\\b", ignore_case = TRUE)))
+
+share_mention_inflation <- mean(speeches$mentions_inflation, na.rm = TRUE)
+
+# Summary table
+basic_exploration <- tibble::tibble(
+  total_speeches,
+  time_start              = as.Date(time_start),
+  time_end                = as.Date(time_end),
+  unique_speakers,
+  word_count_min,
+  word_count_max,
+  word_count_mean,
+  word_count_median,
+  word_count_sd,
+  share_mention_inflation
+)
+
+readr::write_csv(basic_exploration, "tables/basic_exploration.csv")
+basic_exploration
+```
+
+```{r speeches_per_year}
+per_year <- speeches %>%
+  count(year, name = "n_speeches") %>%
+  arrange(year)
+
+ggplot(per_year, aes(year, n_speeches)) +
+  geom_col() +
+  labs(
+    title = "BIS Speeches per Year",
+    x     = "Year",
+    y     = "Number of speeches"
+  ) +
+  theme_minimal()
+
+ggsave("figures/speeches_per_year.png", width = 8, height = 4.5, dpi = 200)
+```
+
+# Part B: Country Assignment
+
+```{r country_map}
+# Lookup table mapping institution keywords to country labels.
+# Matching is done on a concatenation of the description and author fields.
+country_map <- c(
+  "federal reserve"             = "United States",
+  "board of governors"          = "United States",
+  "bank of england"             = "United Kingdom",
+  "european central bank"       = "Euro area",
+  "ecb"                         = "Euro area",
+  "deutsche bundesbank"         = "Germany",
+  "banque de france"            = "France",
+  "banca d'italia"              = "Italy",
+  "bank of japan"               = "Japan",
+  "people's bank of china"      = "China",
+  "bank of canada"              = "Canada",
+  "banco de mexico"             = "Mexico",
+  "banco central do brasil"     = "Brazil",
+  "sveriges riksbank"           = "Sweden",
+  "bank of sweden"              = "Sweden",
+  "reserve bank of australia"   = "Australia",
+  "reserve bank of new zealand" = "New Zealand"
+)
+```
+
+```{r assign_country}
+assign_country <- function(description, author) {
+  text <- tolower(paste(description, author))
+  for (key in names(country_map)) {
+    if (grepl(key, text, fixed = TRUE)) {
+      return(country_map[[key]])
+    }
+  }
+  return("Unknown")
+}
+
+speeches <- speeches %>%
+  mutate(country = mapply(assign_country, description, author))
+```
+
+```{r top10_countries}
+top10 <- speeches %>%
+  filter(country != "Unknown") %>%
+  count(country, sort = TRUE) %>%
+  slice_head(n = 10)
+
+top10
+readr::write_csv(top10, "tables/top10_countries.csv")
+```
+
+```{r speeches_by_country_year}
+selected_countries <- c("United States", "United Kingdom", "Euro area")
+
+per_year_country <- speeches %>%
+  filter(country %in% selected_countries) %>%
+  count(year, country)
+
+ggplot(per_year_country, aes(x = year, y = n, color = country)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Speeches per Year – Selected Central Banks",
+    x     = "Year",
+    y     = "Number of speeches"
+  ) +
+  theme_minimal()
+
+ggsave("figures/speeches_per_year_top3_countries.png", width = 8, height = 4.5, dpi = 200)
+```
+
+# Part C: Inflation Persistence Flags
+
+```{r persistence_patterns}
+# A curated set of phrases that capture language indicating persistent inflation.
+# Kept deliberately narrow to minimize false positives — the goal is to identify
+# speeches where the speaker explicitly characterizes inflation as persistent,
+# not merely mentions it.
+persist_patterns <- c(
+  "persistent inflation",
+  "inflation remains high",
+  "inflation remains elevated",
+  "inflation remains above target",
+  "sticky inflation",
+  "underlying inflation remains",
+  "price pressures.*(persist|continue|expected to continue|likely to continue)",
+  "inflation pressures.*(persist|continue|expected to continue|likely to continue)",
+  "persistence of inflation",
+  "second[- ]round effects"
+)
+
+persist_regex <- paste(persist_patterns, collapse = "|")
+```
+
+```{r flag_speeches}
+speeches <- speeches %>%
+  mutate(flag_persist = str_detect(text, regex(persist_regex, ignore_case = TRUE)))
+```
+
+```{r flag_validation}
+# Manual check: inspect flagged speeches to confirm the pattern is working as intended
+speeches %>%
+  filter(flag_persist) %>%
+  select(date_parsed, author, title) %>%
+  slice_head(n = 10)
+```
+
+```{r flag_summary}
+n_flagged <- sum(speeches$flag_persist, na.rm = TRUE)
+n_total   <- nrow(speeches)
+share_all <- n_flagged / n_total
+
+tibble::tibble(
+  total_speeches      = n_total,
+  flagged_persistence = n_flagged,
+  share_flagged       = share_all
+)
+```
+
+```{r persistence_by_year}
+per_year_persist <- speeches %>%
+  group_by(year) %>%
+  summarize(
+    total   = n(),
+    flagged = sum(flag_persist, na.rm = TRUE),
+    share   = ifelse(total > 0, flagged / total, NA_real_),
+    .groups = "drop"
+  ) %>%
+  arrange(year)
+
+per_year_persist
+readr::write_csv(per_year_persist, "tables/share_persistence_by_year.csv")
+```
+
+```{r persistence_plot}
+ggplot(per_year_persist, aes(x = year, y = share)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Share of Speeches Mentioning Inflation Persistence by Year",
+    x     = "Year",
+    y     = "Share of speeches"
+  ) +
+  theme_minimal()
+
+ggsave("figures/share_inflation_persistence_by_year.png", width = 8, height = 4.5, dpi = 200)
+```

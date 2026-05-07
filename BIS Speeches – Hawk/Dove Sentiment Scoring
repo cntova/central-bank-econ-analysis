@@ -1,0 +1,307 @@
+---
+title: "BIS Speeches – Hawk/Dove Sentiment Scoring (Q4)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+dir.create("figures", showWarnings = FALSE)
+dir.create("tables",  showWarnings = FALSE)
+```
+
+# Overview
+
+This script builds on the cleaned `speeches` data frame produced in Q3
+(`BIS_Speeches_Exploration.Rmd`). Run that script first to ensure the
+object is available in the environment.
+
+# Libraries
+
+```{r libraries}
+library(dplyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(purrr)
+```
+
+# Part A: Hawk/Dove Scoring
+
+## Lexicon Definition
+
+```{r lexicons}
+# Hawkish language: phrases associated with tightening bias, above-target
+# inflation concerns, and removal of monetary accommodation.
+hawk_terms <- c(
+  "raise rates", "rate hikes", "tighten", "tightening", "restrictive",
+  "further increases", "higher for longer", "above target",
+  "inflation remains high", "inflation remains elevated",
+  "fight inflation", "remove accommodation", "normalize policy",
+  "reduce balance sheet", "quantitative tightening"
+)
+
+# Dovish language: phrases associated with easing bias, below-target
+# inflation, and support for growth or liquidity.
+dove_terms <- c(
+  "cut rates", "rate cuts", "ease", "easing", "accommodative",
+  "support growth", "support recovery", "disinflation",
+  "inflation falling", "below target", "provide liquidity",
+  "stimulus", "quantitative easing", "lower for longer"
+)
+
+hawk_rx <- paste(hawk_terms, collapse = "|")
+dove_rx <- paste(dove_terms, collapse = "|")
+```
+
+## Score Top-10 Speakers
+
+```{r score_top10}
+# Restrict scoring to the top-10 most frequent speakers for tractability
+top10_speakers <- speeches %>%
+  count(author, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  pull(author)
+
+sp_top10 <- speeches %>%
+  filter(author %in% top10_speakers)
+
+# Score each speech: hawk_score = hawk_hits / (hawk_hits + dove_hits)
+# Speeches with no keyword matches receive a neutral score of 0.5.
+sp_top10 <- sp_top10 %>%
+  mutate(
+    t          = tolower(text),
+    hawk_hits  = stringr::str_count(t, stringr::regex(hawk_rx, ignore_case = TRUE)),
+    dove_hits  = stringr::str_count(t, stringr::regex(dove_rx, ignore_case = TRUE)),
+    total_hits = hawk_hits + dove_hits,
+    hawk_score = dplyr::if_else(total_hits > 0, hawk_hits / total_hits, 0.5)
+  )
+
+toned_out <- sp_top10 %>%
+  select(date_parsed, author, title, hawk_hits, dove_hits, hawk_score)
+
+readr::write_csv(toned_out, "tables/hawk_dove_scores_top10.csv")
+```
+
+## Identify Extreme Examples
+
+```{r extreme_examples}
+most_hawkish <- toned_out %>%
+  arrange(desc(hawk_score), desc(hawk_hits)) %>%
+  slice_head(n = 3)
+
+most_dovish <- toned_out %>%
+  arrange(hawk_score, desc(dove_hits)) %>%
+  slice_head(n = 3)
+
+most_hawkish
+most_dovish
+```
+
+```{r snippet_helpers}
+# Return short text windows around matched phrases for manual validation
+get_snippets <- function(txt, patterns, window = 50) {
+  rx <- paste(patterns, collapse = "|")
+  m  <- stringr::str_locate_all(
+    string  = tolower(txt),
+    pattern = stringr::regex(rx, ignore_case = TRUE)
+  )[[1]]
+  if (is.null(dim(m)) || nrow(m) == 0) return(character(0))
+  purrr::pmap_chr(as.data.frame(m), function(start, end) {
+    s       <- max(1, start - window)
+    e       <- min(nchar(txt), end + window)
+    snippet <- substr(txt, s, e)
+    snippet <- gsub("\\s+", " ", snippet)
+    paste0("…", snippet, "…")
+  })
+}
+
+get_full_text <- function(row) {
+  speeches %>%
+    filter(
+      date_parsed == row$date_parsed,
+      author      == row$author,
+      title       == row$title
+    ) %>%
+    slice_head(n = 1) %>%
+    pull(text) %>%
+    as.character()
+}
+```
+
+```{r validate_examples}
+hawk_row  <- most_hawkish %>% slice(1)
+dove_row  <- most_dovish  %>% slice(1)
+
+hawk_text <- get_full_text(hawk_row)
+dove_text <- get_full_text(dove_row)
+
+hawk_snips <- get_snippets(hawk_text, hawk_terms, window = 60)
+dove_snips <- get_snippets(dove_text, dove_terms, window = 60)
+
+# Print first three snippets from each to confirm matching is working correctly
+hawk_snips[1:3]
+dove_snips[1:3]
+```
+
+```{r example_labels}
+fmt_date <- function(x) format(as.Date(x), "%Y-%m-%d")
+
+hawk_line <- sprintf(
+  "Hawkish example — %s, %s: scored %.2f. Matched phrase: %s",
+  hawk_row$author,
+  fmt_date(hawk_row$date_parsed),
+  hawk_row$hawk_score,
+  if (length(hawk_snips) > 0) paste0('"', hawk_snips[1], '"') else "tightening / higher-for-longer"
+)
+
+dove_line <- sprintf(
+  "Dovish example — %s, %s: scored %.2f. Matched phrase: %s",
+  dove_row$author,
+  fmt_date(dove_row$date_parsed),
+  dove_row$hawk_score,
+  if (length(dove_snips) > 0) paste0('"', dove_snips[1], '"') else "easing / support for recovery"
+)
+
+hawk_line
+dove_line
+```
+
+```{r save_examples}
+examples <- dplyr::bind_rows(
+  dplyr::mutate(hawk_row, example_type = "hawkish",
+                snippet = if (length(hawk_snips) > 0) hawk_snips[1] else NA_character_),
+  dplyr::mutate(dove_row, example_type = "dovish",
+                snippet = if (length(dove_snips) > 0) dove_snips[1] else NA_character_)
+)
+readr::write_csv(examples, "tables/hawk_dove_examples.csv")
+examples
+```
+
+## Speaker Trend Analysis
+
+```{r speaker_annual}
+annual_speaker <- sp_top10 %>%
+  group_by(author, year) %>%
+  summarise(
+    avg_score  = mean(hawk_score, na.rm = TRUE),
+    n_speeches = n(),
+    .groups    = "drop"
+  )
+
+head(annual_speaker)
+```
+
+```{r speaker_trends}
+# OLS regression of annual average hawk_score on year, separately per speaker.
+# The slope indicates whether a speaker's tone became more hawkish or dovish
+# over the sample period.
+trend_results <- annual_speaker %>%
+  group_by(author) %>%
+  do({
+    model <- lm(avg_score ~ year, data = .)
+    tibble(
+      slope   = coef(model)[["year"]],
+      p_value = summary(model)$coefficients["year", "Pr(>|t|)"]
+    )
+  }) %>%
+  ungroup()
+
+trend_results
+```
+
+```{r plot_speaker_trends}
+# Select the three speakers with the most years of data for plotting
+selected_speakers <- annual_speaker %>%
+  group_by(author) %>%
+  summarise(n_years = n_distinct(year), .groups = "drop") %>%
+  filter(n_years >= 2) %>%
+  arrange(desc(n_years)) %>%
+  slice_head(n = 3) %>%
+  pull(author)
+
+plot_data <- annual_speaker %>%
+  filter(author %in% selected_speakers, !is.na(year), !is.na(avg_score))
+
+if (nrow(plot_data) == 0) {
+  message("No data available for selected speakers.")
+} else {
+  ggplot(plot_data, aes(x = year, y = avg_score, color = author, group = author)) +
+    geom_line(na.rm = TRUE) +
+    geom_point(na.rm = TRUE) +
+    labs(
+      title = "Average Hawkishness Score by Year – Selected Speakers",
+      y     = "Average hawkishness (0 = dovish, 1 = hawkish)",
+      x     = "Year"
+    ) +
+    theme_minimal()
+}
+```
+
+# Part B: Full Corpus Scoring
+
+```{r score_full_corpus}
+# Apply the same hawk/dove scoring to all speeches (not just top-10 speakers)
+speeches <- speeches %>%
+  mutate(
+    text_lc    = tolower(text),
+    hawk_hits  = stringr::str_count(text_lc, stringr::regex(hawk_rx, ignore_case = TRUE)),
+    dove_hits  = stringr::str_count(text_lc, stringr::regex(dove_rx, ignore_case = TRUE)),
+    total_hits = hawk_hits + dove_hits,
+    hawk_score = dplyr::if_else(total_hits > 0, hawk_hits / total_hits, 0.5)
+  )
+```
+
+# Part C: Country-Level Analysis
+
+```{r country_year}
+country_year <- speeches %>%
+  filter(country != "Unknown") %>%
+  group_by(country, year) %>%
+  summarise(
+    avg_score  = mean(hawk_score, na.rm = TRUE),
+    n_speeches = n(),
+    .groups    = "drop"
+  )
+```
+
+```{r country_rankings}
+country_overall <- country_year %>%
+  group_by(country) %>%
+  summarise(mean_score = mean(avg_score, na.rm = TRUE), .groups = "drop")
+
+top10_hawkish <- country_overall %>% arrange(desc(mean_score)) %>% slice_head(n = 10)
+top10_dovish  <- country_overall %>% arrange(mean_score)       %>% slice_head(n = 10)
+
+top10_hawkish
+top10_dovish
+```
+
+```{r country_stability}
+# Countries with the lowest standard deviation in annual hawk_score
+# are interpreted as having the most consistent monetary policy communication.
+country_stability <- country_year %>%
+  group_by(country) %>%
+  summarise(sd_score = sd(avg_score, na.rm = TRUE), .groups = "drop")
+
+top10_stable <- country_stability %>% arrange(sd_score) %>% slice_head(n = 10)
+top10_stable
+```
+
+```{r country_trends_plot}
+ggplot(
+  country_year %>% filter(country %in% c("United States", "Euro area", "Japan")),
+  aes(x = year, y = avg_score, color = country)
+) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Average Hawkishness Score by Year – Selected Countries",
+    x     = "Year",
+    y     = "Average hawkishness (0 = dovish, 1 = hawkish)"
+  ) +
+  theme_minimal()
+```

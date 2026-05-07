@@ -1,0 +1,273 @@
+---
+title: "Liquidity Forecasting – Mexico Currency in Circulation (Q1)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 4.8
+)
+```
+
+# Libraries
+
+```{r libraries}
+# Keeping dependencies minimal and purposeful:
+# - dplyr/lubridate: data cleaning and date handling
+# - ggplot2: reproducible, publication-quality plots
+# - forecast: ETS/SARIMA, Box-Cox transformation, and forecast objects
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(forecast)
+```
+
+# Data Import and Cleaning
+
+```{r load_data}
+# Source: SIE – Banco de México (Banxico), downloaded as CSV.
+# The CSV was used as-is; no manual edits were made before import.
+# Notes on import parameters:
+#   - Header row is on row 19, so the first 18 rows are skipped.
+#   - The file uses Latin-1 encoding (Spanish text with accented characters).
+
+df_raw <- read.csv(
+  "Bank Data.csv",
+  skip            = 18,
+  stringsAsFactors = FALSE,
+  fileEncoding    = "latin1",
+  sep             = ","
+)
+
+# Rename first two columns for clarity: date and series value (e.g. "SF43702")
+df <- df_raw %>%
+  rename(
+    date_raw  = 1,
+    value_raw = 2
+  ) %>%
+  mutate(
+    # parse_date_time handles multiple possible date formats (ymd, dmy, mdy)
+    date  = lubridate::parse_date_time(date_raw, orders = c("ymd", "dmy", "mdy")),
+    # strip thousand separators before coercing to numeric (e.g. "1,234,567" -> 1234567)
+    value = as.numeric(gsub(",", "", value_raw))
+  ) %>%
+  select(date, value) %>%
+  arrange(date)
+
+# Validation checks before proceeding
+stopifnot(!any(is.na(df$date)))
+stopifnot(is.numeric(df$value))
+
+head(df)
+str(df)
+```
+
+# Part A: Trend and Seasonality
+
+```{r plot_levels}
+# Full-history level plot to get a broad picture of the series
+ggplot(df, aes(date, value)) +
+  geom_line(linewidth = 0.7, color = "steelblue") +
+  labs(
+    title    = "Currency in Circulation – Daily Levels (Banxico)",
+    subtitle = paste(format(min(df$date), "%Y-%m-%d"), "to", format(max(df$date), "%Y-%m-%d")),
+    x = "Date",
+    y = "MXN (nominal level)"
+  ) +
+  theme_minimal()
+```
+
+```{r stl_decomposition}
+# STL decomposition to separate trend, seasonal, and remainder components.
+# frequency = 365 is used here as a visual approximation of annual seasonality
+# on daily data. The modeling section below uses frequency = 7 (weekly) instead,
+# which is more appropriate for ARIMA/ETS on daily macro series — see Part B.
+ts_daily <- ts(df$value, frequency = 365)
+decomp   <- stl(ts_daily, s.window = "periodic")
+plot(decomp, main = "STL Decomposition – Trend / Seasonality / Remainder")
+```
+
+```{r monthly_profile}
+# Compute the average level by calendar month across all years
+# to visualize the within-year seasonal pattern.
+df_month <- df %>%
+  mutate(month = month(date, label = TRUE, abbr = TRUE)) %>%
+  group_by(month) %>%
+  summarise(avg = mean(value, na.rm = TRUE), .groups = "drop")
+
+ggplot(df_month, aes(month, avg, group = 1)) +
+  geom_line(linewidth = 0.9, color = "steelblue") +
+  geom_point(size = 2, color = "steelblue") +
+  labs(
+    title = "Average Level by Calendar Month (All Years)",
+    x     = "Month",
+    y     = "Average level"
+  ) +
+  theme_minimal()
+```
+
+**Observations:**
+
+- **Trend:** Clear upward trajectory from 2011 onward, consistent with nominal growth in currency in circulation over time.
+- **Seasonality:** Strong December peak driven by holiday spending. September and October are the seasonal trough; November recovers. This pattern aligns with known Banxico reserve and distribution operations.
+- **Remainder:** Isolated spikes correspond to external shocks (e.g., 2020).
+
+# Part B: Model Selection – SARIMA vs. ETS (Out-of-Sample Test)
+
+```{r ts_setup}
+# Convert to ts object using weekly frequency (m = 7).
+# Rationale: daily macro/liquidity series typically exhibit stable weekly cycles.
+# Annual seasonality is captured through the model's trend and seasonal dynamics
+# rather than a frequency = 365 specification, which would be computationally
+# expensive and numerically unstable for ARIMA estimation.
+y_ts <- ts(df$value, frequency = 7)
+
+# Box-Cox lambda for variance stabilization.
+# A lambda near 1 implies mild transformation; near 0 implies a near-log transform.
+# This helps stabilize variance when the series level grows over time.
+lambda <- BoxCox.lambda(y_ts)
+lambda
+```
+
+```{r out_of_sample}
+# Hold out the last 30 calendar days as a test set.
+# Both models are fit on the training period only, then evaluated on the holdout.
+h_test   <- 30
+n        <- length(y_ts)
+train_ts <- head(y_ts, n - h_test)
+test_ts  <- tail(y_ts, h_test)
+
+# Fit SARIMA on training set (auto.arima searches over (p,d,q)(P,D,Q)[7])
+fit_arima_tr <- auto.arima(train_ts, seasonal = TRUE, lambda = lambda, biasadj = TRUE)
+
+# Fit ETS(A,A,A) on training set (additive error, trend, and seasonality)
+fit_ets_tr   <- ets(train_ts, model = "AAA", lambda = lambda, biasadj = TRUE)
+
+# Generate 30-day forecasts from each model
+fc_arima_te <- forecast(fit_arima_tr, h = h_test)
+fc_ets_te   <- forecast(fit_ets_tr,   h = h_test)
+
+# Error metric functions
+rmse <- function(e) sqrt(mean(e^2, na.rm = TRUE))
+mae  <- function(e) mean(abs(e),   na.rm = TRUE)
+mape <- function(actual, pred) mean(abs((actual - pred) / actual), na.rm = TRUE) * 100
+
+# Compute forecast errors on the holdout
+err_arima <- as.numeric(test_ts - fc_arima_te$mean)
+err_ets   <- as.numeric(test_ts - fc_ets_te$mean)
+
+# Comparison table
+metrics <- data.frame(
+  Model = c("SARIMA", "ETS(A,A,A)"),
+  RMSE  = c(rmse(err_arima), rmse(err_ets)),
+  MAE   = c(mae(err_arima),  mae(err_ets)),
+  MAPE  = c(mape(test_ts, fc_arima_te$mean),
+            mape(test_ts, fc_ets_te$mean))
+)
+metrics
+```
+
+```{r holdout_plot}
+# Visual comparison on the 30-day test window
+df_test_plot <- data.frame(
+  date   = df$date[(n - h_test + 1):n],
+  actual = as.numeric(test_ts),
+  arima  = as.numeric(fc_arima_te$mean),
+  ets    = as.numeric(fc_ets_te$mean)
+)
+
+ggplot(df_test_plot, aes(date)) +
+  geom_line(aes(y = actual), linewidth = 0.7) +
+  geom_line(aes(y = arima), color = "steelblue", linewidth = 0.7) +
+  geom_line(aes(y = ets),   color = "tomato",    linewidth = 0.7) +
+  labs(
+    title    = "Out-of-Sample Forecast (Last 30 Days): Actual vs. Models",
+    subtitle = "Blue = SARIMA  |  Red = ETS(A,A,A)",
+    x = "Date",
+    y = "Level"
+  ) +
+  theme_minimal()
+```
+
+**Model selection rationale:**
+
+SARIMA is typically preferred when the series exhibits strong autocorrelation and asymmetric seasonal peaks. However, ETS(A,A,A) outperformed SARIMA on the holdout by all three error metrics. Given the relatively smooth seasonal structure of this series — a gradual December build-up and September–October trough — ETS's exponential smoothing framework fits the dynamics well. ETS(A,A,A) was therefore selected for the final forecast.
+
+# Part C: 20 Working-Day Forecast
+
+```{r final_forecast}
+# Recompute RMSE from stored errors (avoids ETS object naming issues)
+rmse_arima <- sqrt(mean(err_arima^2, na.rm = TRUE))
+rmse_ets   <- sqrt(mean(err_ets^2,   na.rm = TRUE))
+
+# Select best model, then refit on the full series to use all available data
+use_sarima <- rmse_arima <= rmse_ets
+
+if (use_sarima) {
+  best_fit   <- auto.arima(y_ts, seasonal = TRUE, lambda = lambda, biasadj = TRUE)
+  model_used <- "SARIMA"
+} else {
+  best_fit   <- ets(y_ts, model = "AAA", lambda = lambda, biasadj = TRUE)
+  model_used <- "ETS(A,A,A)"
+}
+
+# Ensure date column is Date type
+df$date <- as.Date(df$date)
+
+# Generate more calendar days than needed, then filter to the first 20 weekdays.
+# This approach avoids hard-coding calendar arithmetic and correctly handles
+# weekends at the boundary of the forecast period.
+h_cal        <- 40
+fc_full      <- forecast(best_fit, h = h_cal)
+last_date    <- max(df$date)
+future_dates <- seq.Date(from = last_date + 1L, by = "day", length.out = h_cal)
+
+# weekday() returns 1 (Mon) through 7 (Sun); keep Mon–Fri
+wk_idx        <- lubridate::wday(future_dates, week_start = 1) <= 5
+workday_dates <- future_dates[wk_idx][1:20]
+workday_pos   <- which(wk_idx)[1:20]
+
+# Assemble forecast table with point estimate and 80/95% prediction intervals
+forecast_df <- data.frame(
+  date    = workday_dates,
+  point   = as.numeric(fc_full$mean)[workday_pos],
+  lower80 = as.numeric(fc_full$lower[workday_pos, "80%"]),
+  upper80 = as.numeric(fc_full$upper[workday_pos, "80%"]),
+  lower95 = as.numeric(fc_full$lower[workday_pos, "95%"]),
+  upper95 = as.numeric(fc_full$upper[workday_pos, "95%"])
+)
+forecast_df
+```
+
+```{r forecast_plot}
+# Plot the last two years of actuals alongside the 20 working-day forecast
+hist_window <- df %>% filter(date >= (max(date) - years(2)))
+
+ggplot() +
+  geom_line(data = hist_window, aes(date, value), linewidth = 0.6) +
+  geom_ribbon(data = forecast_df,
+              aes(x = date, ymin = lower95, ymax = upper95),
+              alpha = 0.2) +
+  geom_line(data = forecast_df, aes(date, point),
+            linewidth = 0.9, color = "steelblue") +
+  labs(
+    title = paste0("Currency in Circulation – 20 Working-Day Forecast (", model_used, ")"),
+    x = "Date",
+    y = "Level (MXN, nominal)"
+  ) +
+  theme_minimal()
+```
+
+**Notes:**
+
+- Weekends are excluded from the forecast table; Mexican public holidays are not removed and would require a separate calendar adjustment.
+- Prediction intervals widen with the forecast horizon, as expected.
+- The forecast continues the established upward trend without a structural break assumption.
